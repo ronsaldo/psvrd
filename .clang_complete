@@ -1,0 +1,3 @@
+-I.
+-Iinclude
+-I/usr/include/libusb-1.0
