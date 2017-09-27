@@ -1,4 +1,5 @@
 #include <psvrd.h>
+#include "message_queue.h"
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -30,7 +31,10 @@
 #define PSVR_REGISTER_HEADSET_ON 0x17
 #define PSVR_REGISTER_VRMODE_ON 0x23
 
-#define MAX_NUMBER_OF_CLIENTS 1024
+#define MAX_NUMBER_OF_CLIENTS 128
+
+#define ACCELERATION_CONVERTION_FACTOR (2.0/2048.0)
+#define GYROSCOPE_CONVERTION_FACTOR (1998.0/(1<<15))
 
 typedef struct __attribute__((packed)) psvr_sensor_state_s
 {
@@ -118,6 +122,11 @@ typedef struct psvrd_client_state_s
 {
     int isValid;
     int fd;
+    int sensorStreamEnabled;
+    int writePolling;
+    uint32_t epollID;
+    uint32_t sendSequence;
+    psvrd_message_queue_t messageSendQueue;
 } psvrd_client_state_t;
 
 static int socketHandle;
@@ -132,10 +141,12 @@ static unsigned char controlReadBuffer[1024];
 
 static struct libusb_transfer *sensorReadTransfer;
 static unsigned char sensorReadBuffer[64];
-
+static psvrd_sensor_state_t currentSensorState;
 static int epollHandle;
 
 static psvrd_client_state_t clientStates[MAX_NUMBER_OF_CLIENTS];
+
+static void broadcastNewSensorState(void);
 
 static const psvr_control_message_t PSVREnableVRTrackingMessage = {
     .generic = {
@@ -203,7 +214,7 @@ static const psvr_control_message_t PSVRPowerOff = {
     }
 };
 
-static void printHexDump(const uint8_t *data, size_t len)
+/*static void printHexDump(const uint8_t *data, size_t len)
 {
     while(len > 0)
     {
@@ -217,6 +228,7 @@ static void printHexDump(const uint8_t *data, size_t len)
         printf("\n");
     }
 }
+*/
 
 static void printSensorState(psvr_sensor_state_t *state)
 {
@@ -258,22 +270,73 @@ static void controlWriteCallback(struct libusb_transfer *transfer)
     libusb_free_transfer(transfer);
 }
 
-static void sendControlMessage(const psvr_control_message_t *message)
+static psvrd_response_code_t sendControlMessage(const psvr_control_message_t *message)
 {
+    if(!psvrDeviceHandle)
+        return PSVRD_RESPONSE_ERROR_NO_HEADSET;
+
     size_t bufferSize = message->generic.header.length + sizeof(psvr_control_message_header_t);
     unsigned char *buffer = malloc(bufferSize);
     memcpy(buffer, message, bufferSize);
 
     struct libusb_transfer *transfer = libusb_alloc_transfer(0);
     libusb_fill_bulk_transfer(transfer, psvrDeviceHandle, PSVR_CONTROL_WRITE_ENDPOINT, buffer, bufferSize, controlWriteCallback, NULL, 0);
+    libusb_submit_transfer(transfer);
+
+    return PSVRD_RESPONSE_OK;
+}
+
+static psvrd_vector3_t convertAccelerometeVector3(psvr_sensor_state_t *state)
+{
+    psvrd_vector3_t res = {
+        .x = (state->ax >> 4) * ACCELERATION_CONVERTION_FACTOR,
+        .y = (state->ay >> 4) * ACCELERATION_CONVERTION_FACTOR,
+        .z = (state->az >> 4) * ACCELERATION_CONVERTION_FACTOR,
+    };
+
+    return res;
+}
+
+static psvrd_vector3_t convertGyroscopeVector3(psvr_sensor_state_t *state)
+{
+    psvrd_vector3_t res = {
+        .x = state->yaw * GYROSCOPE_CONVERTION_FACTOR,
+        .y = state->pitch * GYROSCOPE_CONVERTION_FACTOR,
+        .z = state->roll * GYROSCOPE_CONVERTION_FACTOR,
+    };
+
+    return res;
+}
+
+static void storeRawSensorState(psvr_sensor_state_t *state, psvrd_raw_sensor_state_t *messageState)
+{
+    messageState->milliseconds = state->timestamp;
+    messageState->accelerometer = convertAccelerometeVector3(state);
+    messageState->gyroscope = convertGyroscopeVector3(state);
+}
+
+static void integrateSensorState(psvr_sensor_state_t *state)
+{
+}
+
+static void processSensorData(psvr_sensor_message_t *sensorMessage)
+{
+    currentSensorState.rawSensorStateCount = 2;
+    storeRawSensorState(&sensorMessage->sensorState1, &currentSensorState.rawSensorStates[0]);
+    storeRawSensorState(&sensorMessage->sensorState2, &currentSensorState.rawSensorStates[1]);
+
+    integrateSensorState(&sensorMessage->sensorState1);
+    integrateSensorState(&sensorMessage->sensorState2);
+    //printHexDump(transfer->buffer, transfer->actual_length);
+    //printSensorMessage();
+    broadcastNewSensorState();
 }
 
 static void sensorReadCallback(struct libusb_transfer *transfer)
 {
     if(transfer->status == LIBUSB_TRANSFER_COMPLETED)
     {
-        //printHexDump(transfer->buffer, transfer->actual_length);
-        printSensorMessage((psvr_sensor_message_t*)transfer->buffer);
+        processSensorData((psvr_sensor_message_t*)transfer->buffer);
         libusb_submit_transfer(transfer);
     }
     else if(transfer->status == LIBUSB_TRANSFER_NO_DEVICE)
@@ -433,13 +496,21 @@ static void handleMainSocketEvents(uint32_t events)
     {
         struct sockaddr_un clientAddress;
         socklen_t clientAddressLen = sizeof(clientAddress);
-        int clientSocket = accept(socketHandle, (struct sockaddr *)&clientAddress, &clientAddressLen);
+        int clientSocket;
+        do
+        {
+            clientSocket = accept(socketHandle, (struct sockaddr *)&clientAddress, &clientAddressLen);
+        } while(clientSocket < 0 && errno == EINTR);
+
         if(clientSocket < 0)
         {
-            if(clientSocket != EWOULDBLOCK && clientSocket != EAGAIN)
+            if(errno != EAGAIN)
                 perror("Failed to accept a client.\n");
             return;
         }
+
+        /* Make sure the client socket is non-blocking. */
+        fcntl(clientSocket, F_SETFL, fcntl(clientSocket, F_GETFL) | O_NONBLOCK);
 
         /* Find an invalid client state */
         int clientID;
@@ -459,14 +530,208 @@ static void handleMainSocketEvents(uint32_t events)
 
         clientStates[clientID].isValid = 1;
         clientStates[clientID].fd = clientSocket;
-
+        clientStates[clientID].epollID = clientID + 2;
         {
             struct epoll_event event;
-            event.data.u32 = clientID + 2;
+            event.data.u32 = clientStates[clientID].epollID;
             event.events = EPOLLIN | EPOLLRDHUP | EPOLLERR;
             epoll_ctl(epollHandle, EPOLL_CTL_ADD, clientSocket, &event);
         }
     }
+}
+
+static void activateClientWritePolling(psvrd_client_state_t *clientState)
+{
+    if(clientState->writePolling)
+        return;
+
+    {
+        struct epoll_event event;
+        event.data.u32 = clientState->epollID;
+        event.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLERR;
+        epoll_ctl(epollHandle, EPOLL_CTL_MOD, clientState->fd, &event);
+    }
+    clientState->writePolling = 1;
+}
+
+static void disableClientWritePolling(psvrd_client_state_t *clientState)
+{
+    if(!clientState->writePolling)
+        return;
+
+    {
+        struct epoll_event event;
+        event.data.u32 = clientState->epollID;
+        event.events = EPOLLIN | EPOLLRDHUP | EPOLLERR;
+        epoll_ctl(epollHandle, EPOLL_CTL_MOD, clientState->fd, &event);
+    }
+
+    clientState->writePolling = 0;
+}
+
+static void sendMessageToClient(psvrd_client_state_t *clientState, psvrd_message_header_t *messageHeader)
+{
+    assert(clientState->isValid);
+    ssize_t n;
+
+    /* If the queue is not empty, send the message through the queue to preserve message ordering. */
+    if(clientState->writePolling)
+    {
+        psvrd_mq_push(&clientState->messageSendQueue, messageHeader);
+        return;
+    }
+
+    do
+    {
+        n = send(clientState->fd, messageHeader, messageHeader->length, 0);
+    } while(n < 0 && errno == EINTR);
+
+    if(n >= 0)
+        return;
+
+    /* Do we need to enqueue the message send? */
+    if(errno == EAGAIN)
+    {
+        psvrd_mq_push(&clientState->messageSendQueue, messageHeader);
+        activateClientWritePolling(clientState);
+    }
+    else
+    {
+        if(errno != EPIPE)
+            perror("Failed to send message to client.");
+    }
+}
+
+static void sendMessageResponseCode(psvrd_client_state_t *clientState, uint32_t requestSequence, psvrd_response_code_t responseCode)
+{
+    psvrd_message_response_t response;
+    response.header.type = PSVRD_MESSAGE_RESPONSE_CODE;
+    response.header.sequence = clientState->sendSequence++;
+    response.header.requestSequence = requestSequence;
+    response.header.length = sizeof(response);
+    response.header.flags = PSVRD_MESSAGE_FLAG_RESPONSE;
+    response.code = responseCode;
+    sendMessageToClient(clientState, &response.header);
+}
+
+static void sendSensorDataToClient(psvrd_client_state_t *clientState)
+{
+    psvrd_sensor_state_t message = currentSensorState;
+    message.header.type = PSVRD_MESSAGE_SENSOR_STATE;
+    message.header.sequence = clientState->sendSequence++;
+    message.header.requestSequence = 0;
+    message.header.length = sizeof(message);
+    message.header.flags = 0;
+    sendMessageToClient(clientState, &message.header);
+}
+
+static void broadcastNewSensorState(void)
+{
+    for(int i = 0; i < MAX_NUMBER_OF_CLIENTS; ++i)
+    {
+        psvrd_client_state_t *client = &clientStates[i];
+        if(client->isValid && client->sensorStreamEnabled)
+            sendSensorDataToClient(client);
+    }
+}
+
+static void writePendingClientMessages(psvrd_client_state_t *clientState)
+{
+    psvrd_generic_message_t *nextMessage;
+    ssize_t n;
+
+    while((nextMessage = psvrd_mq_top(&clientState->messageSendQueue)))
+    {
+        do
+        {
+            n = send(clientState->fd, nextMessage, nextMessage->header.length, 0);
+        } while(n < 0 && errno == EINTR);
+
+        /* check for errors. */
+        if(n < 0)
+        {
+            if(errno != EAGAIN && errno != EPIPE)
+                perror("Failed to send to client socket.");
+            return;
+        }
+
+        /* Pop the message from the queue*/
+        psvrd_mq_pop(&clientState->messageSendQueue);
+    }
+
+    /* If the queue is now empty, disable the polling from the client state. */
+    if(psvrd_mq_isEmpty(&clientState->messageSendQueue))
+        disableClientWritePolling(clientState);
+}
+
+static int readAndProcessClientMessage(psvrd_client_state_t *clientState)
+{
+    psvrd_generic_message_t genericMessage;
+    ssize_t n;
+
+    /* Read a single message from the socket*/
+    do
+    {
+        n = recv(clientState->fd, &genericMessage, sizeof(genericMessage), 0);
+    } while(n < 0 && errno == EINTR);
+
+    /* Check for errors*/
+    if(n < 0)
+    {
+        if(errno != EAGAIN && errno != EPIPE)
+            perror("Failed to read from client socket.");
+
+        return 0;
+    }
+
+    /* Check the size of the message */
+    if(n < sizeof(psvrd_message_header_t) || n > sizeof(genericMessage) || genericMessage.header.length != n )
+        return 0;
+
+    /* Process the message. */
+    psvrd_response_code_t responseCode = PSVRD_RESPONSE_ERROR;
+
+    switch(genericMessage.header.type)
+    {
+    case PSVRD_MESSAGE_HEADSET_ON:
+        responseCode = sendControlMessage(&PSVRHeadsetOn);
+        sendMessageResponseCode(clientState, genericMessage.header.sequence, responseCode);
+        break;
+    case PSVRD_MESSAGE_HEADSET_OFF:
+        responseCode = sendControlMessage(&PSVRHeadsetOff);
+        sendMessageResponseCode(clientState, genericMessage.header.sequence, responseCode);
+        break;
+    case PSVRD_MESSAGE_POWER_OFF:
+        responseCode = sendControlMessage(&PSVRPowerOff);
+        sendMessageResponseCode(clientState, genericMessage.header.sequence, responseCode);
+        break;
+    case PSVRD_MESSAGE_ACTIVATE_VR_MODE:
+        responseCode = sendControlMessage(&PSVREnterVRMode);
+        sendMessageResponseCode(clientState, genericMessage.header.sequence, responseCode);
+        break;
+    case PSVRD_MESSAGE_CINEMATIC_MODE:
+        responseCode = sendControlMessage(&PSVRLeaveVRMode);
+        sendMessageResponseCode(clientState, genericMessage.header.sequence, responseCode);
+        break;
+    case PSVRD_MESSAGE_REQUEST_SENSOR_STREAM:
+        responseCode = PSVRD_RESPONSE_OK;
+        sendMessageResponseCode(clientState, genericMessage.header.sequence, responseCode);
+
+        clientState->sensorStreamEnabled = 1;
+        sendSensorDataToClient(clientState);
+        break;
+    default:
+        fprintf(stderr, "Received unknown message %08X from client fd number %u.\n", genericMessage.header.type, clientState->fd);
+        break;
+    }
+
+    return 1;
+}
+
+static void readAndProcessClientMessages(psvrd_client_state_t *clientState)
+{
+    while(readAndProcessClientMessage(clientState))
+        ;
 }
 
 static void handleClientSocketEvents(uint32_t clientID, uint32_t events)
@@ -489,7 +754,23 @@ static void handleClientSocketEvents(uint32_t clientID, uint32_t events)
         return;
     }
 
-    printf("handleClientSocketEvents[%d] %d\n", clientID, events);
+    /* Did we get an error? */
+    if(events & EPOLLERR)
+    {
+        /*TODO: Do something*/
+    }
+
+    /* Write the pending packets to the socket. */
+    if(events & EPOLLOUT)
+    {
+        writePendingClientMessages(clientState);
+    }
+
+    /* Read from the socket. */
+    if(events & EPOLLIN)
+    {
+        readAndProcessClientMessages(clientState);
+    }
 }
 
 static void handleSocketEvents(uint32_t socketID, uint32_t events)
@@ -508,6 +789,19 @@ static void handleSocketEvents(uint32_t socketID, uint32_t events)
         /* Read/write data to the socket*/
         handleClientSocketEvents(socketID - 2, events);
     }
+}
+
+static void pollfdAdded(int fd, short events, void *userData)
+{
+    struct epoll_event event;
+    event.data.u32 = 0;
+    event.events = events;
+    epoll_ctl(epollHandle, EPOLL_CTL_ADD, fd, &event);
+}
+
+static void pollfdRemoved(int fd, void *userData)
+{
+    epoll_ctl(epollHandle, EPOLL_CTL_DEL, fd, NULL);
 }
 
 static void mainLoop(void)
@@ -539,6 +833,8 @@ static void mainLoop(void)
         libusb_free_pollfds(pollfds);
     }
 
+    libusb_set_pollfd_notifiers(context, pollfdAdded, pollfdRemoved, NULL);
+
     /* Main event loop*/
     struct timeval zeroTimeout = {0, 0};
     while(!quitting)
@@ -549,7 +845,7 @@ static void mainLoop(void)
             perror("epoll wait failed");
             break;
         }
-        printf("pending event count: %d\n", pendingEventCount);
+        /* printf("pending event count: %d\n", pendingEventCount); */
 
         /* Check for libUSB events. */
         int haveLibUSBEvents = 0;
@@ -572,6 +868,10 @@ static void mainLoop(void)
                 handleSocketEvents(pendingEvents[i].data.fd, pendingEvents[i].events);
         }
     }
+
+    /* Destroy the epoll handle. */
+    libusb_set_pollfd_notifiers(context, NULL, NULL, NULL);
+    close(epollHandle);
 }
 
 static int serverMain(void)
@@ -593,7 +893,49 @@ static int serverMain(void)
     return 0;
 }
 
+static void printHelp(void)
+{
+    printf(
+"psvrd [options]                                                             \n\
+-d                                 Start as daemon.\n\
+-h                                 Print help message.\n\
+-v                                 Print version message\n\
+"
+    );
+}
+
+static void printVersion(void)
+{
+}
+
+static int startDaemon(void)
+{
+    return 0;
+}
+
 int main(int argc, char* argv[])
 {
+    int daemon = 0;
+    for(int i = 1; i < argc; ++i)
+    {
+        if(!strcmp(argv[i], "-d"))
+        {
+            daemon = 1;
+        }
+        else if(!strcmp(argv[i], "-h"))
+        {
+            printHelp();
+            return 0;
+        }
+        else if(!strcmp(argv[i], "-version"))
+        {
+            printVersion();
+            return 0;
+        }
+    }
+
+    if(daemon)
+        return startDaemon();
+
     return serverMain();
 }

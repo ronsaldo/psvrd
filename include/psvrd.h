@@ -6,18 +6,33 @@
 #define PSVR_SOCKET_LOCATION "/var/run/psvr.socket"
 
 #define PSVRD_FOURCC(a, b, c, d) ((a) | ((b) << 8) | ((c) << 16) | ((d) << 24))
+#define PSVRD_MAX_MESSAGE_SIZE 256
 
 typedef enum psvrd_message_type_e {
     /* Activation commands. */
     PSVRD_MESSAGE_HEADSET_ON = PSVRD_FOURCC('H', 'D', 'O', 'N'),
     PSVRD_MESSAGE_HEADSET_OFF = PSVRD_FOURCC('H', 'D', 'O', 'F'),
-    PSVRD_MESSAGE_SHUTDOWN = PSVRD_FOURCC('S', 'H', 'T', 'D'),
+    PSVRD_MESSAGE_POWER_OFF = PSVRD_FOURCC('P', 'W', 'R', 'O'),
     PSVRD_MESSAGE_ACTIVATE_VR_MODE = PSVRD_FOURCC('V', 'R', 'M', 'D'),
     PSVRD_MESSAGE_CINEMATIC_MODE = PSVRD_FOURCC('C', 'N', 'M', 'D'),
+
+    /* Request the server to send us a continous stream with the sensor data. */
+    PSVRD_MESSAGE_REQUEST_SENSOR_STREAM = PSVRD_FOURCC('S', 'N', 'S', 'T'),
+
+    /* Message responses*/
+    PSVRD_MESSAGE_RESPONSE_CODE = PSVRD_FOURCC('R', 'E', 'S', 'C'),
 
     /* Periodical updates. */
     PSVRD_MESSAGE_SENSOR_STATE =  PSVRD_FOURCC('S', 'N', 'S', 'R')
 } psvrd_message_type_t;
+
+typedef enum psvrd_response_code_e {
+    PSVRD_RESPONSE_OK = 0,
+    PSVRD_RESPONSE_ERROR,
+    PSVRD_RESPONSE_ERROR_NO_HEADSET,
+} psvrd_response_code_t;
+
+#define PSVRD_MESSAGE_FLAG_RESPONSE (1<<0)
 
 /**
  * PSVRD message header.
@@ -26,6 +41,9 @@ typedef struct psvrd_message_header_s
 {
     psvrd_message_type_t type;
     uint16_t length; /* Includes the size of the header. */
+    uint32_t sequence;
+    uint32_t requestSequence;
+    uint32_t flags;
 } psvrd_message_header_t;
 
 /**
@@ -41,7 +59,7 @@ typedef struct psvrd_quaternion_s
  */
 typedef struct psvrd_vector3_s
 {
-    float x, y, z, w;
+    float x, y, z;
 } psvrd_vector3_t;
 
 /**
@@ -49,7 +67,7 @@ typedef struct psvrd_vector3_s
  */
 typedef struct psvrd_raw_sensor_state_s
 {
-    uint64_t milliseconds;
+    uint32_t milliseconds;
     psvrd_vector3_t gyroscope;
     psvrd_vector3_t accelerometer;
 } psvrd_raw_sensor_state_t;
@@ -70,5 +88,23 @@ typedef struct psvrd_sensor_state_s
     uint32_t rawSensorStateCount;
     psvrd_raw_sensor_state_t rawSensorStates[4];
 } psvrd_sensor_state_t;
+
+typedef struct psvrd_message_response_s
+{
+    /* The message header. */
+    psvrd_message_header_t header;
+
+    /* Ther response code. */
+    psvrd_response_code_t code;
+} psvrd_message_response_t;
+
+/**
+ * Generic psvrd message
+ */
+typedef struct psvrd_generic_message_s
+{
+    psvrd_message_header_t header;
+    uint8_t payload[PSVRD_MAX_MESSAGE_SIZE - sizeof(psvrd_message_header_t)];
+} psvrd_generic_message_t;
 
 #endif /*PSVRD_H*/

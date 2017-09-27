@@ -1,4 +1,5 @@
 set(PSVRD_SOURCES
+    message_queue.c
     psvrd.c
 )
 
