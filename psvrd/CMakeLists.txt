@@ -4,6 +4,9 @@ set(PSVRD_SOURCES
 )
 
 add_executable(psvrd ${PSVRD_SOURCES})
-target_link_libraries(psvrd ${LIBUSB_LIB})
+target_link_libraries(psvrd ${LIBUSB_LIB} m)
+
+add_library(psvrd-client SHARED psvrd-client.c message_queue.c)
 
 add_executable(psvrd_control psvrd_control.c)
+target_link_libraries(psvrd_control psvrd-client)

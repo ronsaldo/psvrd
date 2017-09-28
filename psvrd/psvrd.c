@@ -1,5 +1,6 @@
 #include <psvrd.h>
 #include "message_queue.h"
+#include "vmath.h"
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -16,6 +17,12 @@
 #include <sys/epoll.h>
 
 #include <assert.h>
+
+#define PSVRD_CALIBRATION_SAMPLES 3000
+#define PSVRD_UP_VECTOR gravityVector
+/*#define PSVRD_UP_VECTOR psvrd_vector3_new(0, 1, 0)*/
+
+#define PSVRD_COMPLEMENTARY_FILTER_ALPHA 0.001
 
 #define PSVR_VENDOR_ID 0x054c
 #define PSVR_PRODUCT_ID 0x09af
@@ -34,7 +41,7 @@
 #define MAX_NUMBER_OF_CLIENTS 128
 
 #define ACCELERATION_CONVERTION_FACTOR (2.0/2048.0)
-#define GYROSCOPE_CONVERTION_FACTOR (1998.0/(1<<15))
+#define GYROSCOPE_CONVERTION_FACTOR ((1998.0/(1<<15)) * (M_PI/180.0))
 
 typedef struct __attribute__((packed)) psvr_sensor_state_s
 {
@@ -142,6 +149,16 @@ static unsigned char controlReadBuffer[1024];
 static struct libusb_transfer *sensorReadTransfer;
 static unsigned char sensorReadBuffer[64];
 static psvrd_sensor_state_t currentSensorState;
+static psvrd_quaternion_t centerOrientation;
+static psvrd_quaternion_t currentOrientation;
+
+static uint32_t lastIntegrationTimestamp;
+static uint32_t integrationSamples;
+
+static psvrd_quaternion_t gyroscopeBias;
+static psvrd_vector3_t accelerometerBias;
+static psvrd_vector3_t gravityVector;
+
 static int epollHandle;
 
 static psvrd_client_state_t clientStates[MAX_NUMBER_OF_CLIENTS];
@@ -230,21 +247,24 @@ static const psvr_control_message_t PSVRPowerOff = {
 }
 */
 
-static void printSensorState(psvr_sensor_state_t *state)
+static void
+printSensorState(psvr_sensor_state_t *state)
 {
     printf("%08X %04d %04d %04d - %04d %04d %04d\n",
         state->timestamp,
         state->yaw, state->pitch, state->roll, state->ax>>4, state->ay>>4, state->az>>4);
 }
 
-static void printSensorMessage(psvr_sensor_message_t *message)
+static void
+printSensorMessage(psvr_sensor_message_t *message)
 {
     printf("Sensor message %zu, %zu\n", sizeof(psvr_sensor_message_t), sizeof(psvr_sensor_state_t));
     printSensorState(&message->sensorState1);
     printSensorState(&message->sensorState2);
 }
 
-static void controlReadCallback(struct libusb_transfer *transfer)
+static void
+controlReadCallback(struct libusb_transfer *transfer)
 {
     if(transfer->status == LIBUSB_TRANSFER_COMPLETED)
     {
@@ -264,13 +284,15 @@ static void controlReadCallback(struct libusb_transfer *transfer)
     }
 }
 
-static void controlWriteCallback(struct libusb_transfer *transfer)
+static void
+controlWriteCallback(struct libusb_transfer *transfer)
 {
     free(transfer->buffer);
     libusb_free_transfer(transfer);
 }
 
-static psvrd_response_code_t sendControlMessage(const psvr_control_message_t *message)
+static psvrd_response_code_t
+sendControlMessage(const psvr_control_message_t *message)
 {
     if(!psvrDeviceHandle)
         return PSVRD_RESPONSE_ERROR_NO_HEADSET;
@@ -285,41 +307,142 @@ static psvrd_response_code_t sendControlMessage(const psvr_control_message_t *me
 
     return PSVRD_RESPONSE_OK;
 }
-
-static psvrd_vector3_t convertAccelerometeVector3(psvr_sensor_state_t *state)
+static psvrd_vector3_t
+rotateSensorCoordinates(psvrd_vector3_t v)
 {
-    psvrd_vector3_t res = {
-        .x = (state->ax >> 4) * ACCELERATION_CONVERTION_FACTOR,
-        .y = (state->ay >> 4) * ACCELERATION_CONVERTION_FACTOR,
-        .z = (state->az >> 4) * ACCELERATION_CONVERTION_FACTOR,
-    };
-
-    return res;
+    return psvrd_vector3_new(-v.y, v.x, v.z);
 }
 
-static psvrd_vector3_t convertGyroscopeVector3(psvr_sensor_state_t *state)
+static psvrd_vector3_t
+convertAccelerometerVector3(psvr_sensor_state_t *state)
 {
-    psvrd_vector3_t res = {
-        .x = state->yaw * GYROSCOPE_CONVERTION_FACTOR,
-        .y = state->pitch * GYROSCOPE_CONVERTION_FACTOR,
-        .z = state->roll * GYROSCOPE_CONVERTION_FACTOR,
-    };
-
-    return res;
+    return rotateSensorCoordinates(psvrd_vector3_new(
+        (state->ax >> 4) * ACCELERATION_CONVERTION_FACTOR,
+        (state->ay >> 4) * ACCELERATION_CONVERTION_FACTOR,
+        (state->az >> 4) * ACCELERATION_CONVERTION_FACTOR));
 }
 
-static void storeRawSensorState(psvr_sensor_state_t *state, psvrd_raw_sensor_state_t *messageState)
+static psvrd_vector3_t
+convertGyroscopeVector3(psvr_sensor_state_t *state)
+{
+    return rotateSensorCoordinates(psvrd_vector3_new(
+        state->yaw * GYROSCOPE_CONVERTION_FACTOR,
+        state->pitch * GYROSCOPE_CONVERTION_FACTOR,
+        state->roll * GYROSCOPE_CONVERTION_FACTOR));
+}
+
+static void
+storeRawSensorState(psvr_sensor_state_t *state, psvrd_raw_sensor_state_t *messageState)
 {
     messageState->milliseconds = state->timestamp;
-    messageState->accelerometer = convertAccelerometeVector3(state);
+    messageState->accelerometer = convertAccelerometerVector3(state);
     messageState->gyroscope = convertGyroscopeVector3(state);
 }
 
-static void integrateSensorState(psvr_sensor_state_t *state)
+static void
+resetSensorState(void)
 {
+    currentOrientation = psvrd_quaternion_unit();
+    centerOrientation = psvrd_quaternion_unit();
+    integrationSamples = 0;
 }
 
-static void processSensorData(psvr_sensor_message_t *sensorMessage)
+static int
+computeSensorDeltaTime(uint32_t newTimeStamp, uint32_t oldTimeStamp)
+{
+    int result = newTimeStamp - lastIntegrationTimestamp;
+    /* Handle the case for overflow*/
+    if(result < 0)
+        result = newTimeStamp + 0x01000000 - lastIntegrationTimestamp;
+    return result;
+}
+
+static void
+processCalibrationSensorSample(psvr_sensor_state_t *state)
+{
+    /* For the first sample, only store the timestamp. */
+    if(integrationSamples == 0)
+    {
+        integrationSamples = 1;
+        lastIntegrationTimestamp = state->timestamp;
+        gyroscopeBias = psvrd_quaternion_new(0, 0, 0, 0);
+        accelerometerBias = psvrd_vector3_new(0, 0, 0);
+        return;
+    }
+
+    psvrd_vector3_t accelerometer = convertAccelerometerVector3(state);
+    /*printf("Acceloremeter: %f %f %f\n", accelerometer.x, accelerometer.y, accelerometer.z);*/
+
+    gyroscopeBias = psvrd_quaternion_add(gyroscopeBias, psvrd_quaternion_newv(0, convertGyroscopeVector3(state)));
+    accelerometerBias = psvrd_vector3_add(accelerometerBias, accelerometer);
+    ++integrationSamples;
+
+    if(integrationSamples <= PSVRD_CALIBRATION_SAMPLES)
+        return;
+
+    /* Normalize the result for the bias. */
+    gyroscopeBias = psvrd_quaternion_divs(gyroscopeBias, PSVRD_CALIBRATION_SAMPLES);
+    accelerometerBias = psvrd_vector3_divs(accelerometerBias, PSVRD_CALIBRATION_SAMPLES);
+
+    gravityVector = psvrd_vector3_normalizeNonZero(accelerometerBias);
+    accelerometerBias = psvrd_vector3_sub(accelerometerBias, gravityVector);
+    printf("Gravity vector: %f %f %f\n",
+        gravityVector.x, gravityVector.y, gravityVector.z);
+
+    currentOrientation = psvrd_quaternion_unit();
+    centerOrientation = psvrd_quaternion_inverse(currentOrientation);
+
+    printf("Gyro bias: %f %f %f, Accel bias: %f %f %f \n",
+        gyroscopeBias.x, gyroscopeBias.y, gyroscopeBias.z,
+        accelerometerBias.x, accelerometerBias.y, accelerometerBias.z
+    );
+}
+
+static void
+integrateSensorState(psvr_sensor_state_t *state)
+{
+    /* We need a first time stamp*/
+    if(integrationSamples <= PSVRD_CALIBRATION_SAMPLES)
+    {
+        processCalibrationSensorSample(state);
+        return;
+    }
+
+    /* Compute the delta and handle case of the overflow the overflow */
+    int deltaMicroseconds = computeSensorDeltaTime(state->timestamp, lastIntegrationTimestamp);
+    lastIntegrationTimestamp = state->timestamp;
+
+    /* Compute the derivative. */
+    psvrd_scalar_t delta = deltaMicroseconds* ((psvrd_scalar_t)1e-6);
+    psvrd_quaternion_t omega = psvrd_quaternion_sub(
+            psvrd_quaternion_newv(0, convertGyroscopeVector3(state)),
+            gyroscopeBias);
+
+    /* Integrate the orientation. */
+    psvrd_quaternion_t orientationDerivative = psvrd_quaternion_mul(currentOrientation, psvrd_quaternion_muls(omega, 0.5));
+    psvrd_quaternion_t integratedOrientation = psvrd_quaternion_normalizeNonZero(psvrd_quaternion_add(currentOrientation, psvrd_quaternion_muls(orientationDerivative, delta)));
+
+    /* Compute the tilt. */
+    psvrd_vector3_t accelerometer = psvrd_vector3_sub(convertAccelerometerVector3(state), accelerometerBias);
+    psvrd_quaternion_t tilt = psvrd_quaternion_toRotateVectorIntoAnotherVector(
+        psvrd_vector3_normalizeNonZero(accelerometer),
+        PSVRD_UP_VECTOR);
+
+    /* Mix the measures of the two sensors with a complementary filter. */
+    /* TODO: Use a Kalman filter. */
+    currentOrientation = psvrd_quaternion_normalizeNonZero(psvrd_quaternion_add(
+            psvrd_quaternion_muls(integratedOrientation, 1.0 - PSVRD_COMPLEMENTARY_FILTER_ALPHA),
+            psvrd_quaternion_muls(tilt, PSVRD_COMPLEMENTARY_FILTER_ALPHA)
+        ));
+
+    /*currentOrientation = integratedOrientation;*/
+
+    currentSensorState.omega = orientationDerivative;
+    currentSensorState.orientation = psvrd_quaternion_mul(centerOrientation, currentOrientation);
+}
+
+static void
+processSensorData(psvr_sensor_message_t *sensorMessage)
 {
     currentSensorState.rawSensorStateCount = 2;
     storeRawSensorState(&sensorMessage->sensorState1, &currentSensorState.rawSensorStates[0]);
@@ -332,7 +455,8 @@ static void processSensorData(psvr_sensor_message_t *sensorMessage)
     broadcastNewSensorState();
 }
 
-static void sensorReadCallback(struct libusb_transfer *transfer)
+static void
+sensorReadCallback(struct libusb_transfer *transfer)
 {
     if(transfer->status == LIBUSB_TRANSFER_COMPLETED)
     {
@@ -349,7 +473,8 @@ static void sensorReadCallback(struct libusb_transfer *transfer)
     }
 }
 
-static int openPSVRDevice(struct libusb_device *psvrDevice)
+static int
+openPSVRDevice(struct libusb_device *psvrDevice)
 {
     /* Open the PSVR device*/
     int error = libusb_open(psvrDevice, &psvrDeviceHandle);
@@ -397,7 +522,8 @@ static int openPSVRDevice(struct libusb_device *psvrDevice)
     return 0;
 }
 
-static int hotplugCallback(libusb_context *context, libusb_device *device, libusb_hotplug_event event, void *userdata)
+static int
+hotplugCallback(libusb_context *context, libusb_device *device, libusb_hotplug_event event, void *userdata)
 {
     struct libusb_device_descriptor descriptor;
     int error = libusb_get_device_descriptor(device, &descriptor);
@@ -426,7 +552,8 @@ static int hotplugCallback(libusb_context *context, libusb_device *device, libus
     return 0;
 }
 
-static int initializeLibUSB(void)
+static int
+initializeLibUSB(void)
 {
     /* Initialize libusb. */
     int error = libusb_init(&context);
@@ -456,7 +583,8 @@ static int initializeLibUSB(void)
     return 0;
 }
 
-static int startSocket(void)
+static int
+startSocket(void)
 {
     /* Create the socket. */
     socketHandle = socket(AF_UNIX, SOCK_SEQPACKET, 0);
@@ -490,7 +618,8 @@ static int startSocket(void)
     return 0;
 }
 
-static void handleMainSocketEvents(uint32_t events)
+static void
+handleMainSocketEvents(uint32_t events)
 {
     if(events & EPOLLIN)
     {
@@ -540,7 +669,8 @@ static void handleMainSocketEvents(uint32_t events)
     }
 }
 
-static void activateClientWritePolling(psvrd_client_state_t *clientState)
+static void
+activateClientWritePolling(psvrd_client_state_t *clientState)
 {
     if(clientState->writePolling)
         return;
@@ -554,7 +684,8 @@ static void activateClientWritePolling(psvrd_client_state_t *clientState)
     clientState->writePolling = 1;
 }
 
-static void disableClientWritePolling(psvrd_client_state_t *clientState)
+static void
+disableClientWritePolling(psvrd_client_state_t *clientState)
 {
     if(!clientState->writePolling)
         return;
@@ -569,7 +700,8 @@ static void disableClientWritePolling(psvrd_client_state_t *clientState)
     clientState->writePolling = 0;
 }
 
-static void sendMessageToClient(psvrd_client_state_t *clientState, psvrd_message_header_t *messageHeader)
+static void
+sendMessageToClient(psvrd_client_state_t *clientState, psvrd_message_header_t *messageHeader)
 {
     assert(clientState->isValid);
     ssize_t n;
@@ -602,7 +734,8 @@ static void sendMessageToClient(psvrd_client_state_t *clientState, psvrd_message
     }
 }
 
-static void sendMessageResponseCode(psvrd_client_state_t *clientState, uint32_t requestSequence, psvrd_response_code_t responseCode)
+static void
+sendMessageResponseCode(psvrd_client_state_t *clientState, uint32_t requestSequence, psvrd_response_code_t responseCode)
 {
     psvrd_message_response_t response;
     response.header.type = PSVRD_MESSAGE_RESPONSE_CODE;
@@ -614,7 +747,8 @@ static void sendMessageResponseCode(psvrd_client_state_t *clientState, uint32_t 
     sendMessageToClient(clientState, &response.header);
 }
 
-static void sendSensorDataToClient(psvrd_client_state_t *clientState)
+static void
+sendSensorDataToClient(psvrd_client_state_t *clientState)
 {
     psvrd_sensor_state_t message = currentSensorState;
     message.header.type = PSVRD_MESSAGE_SENSOR_STATE;
@@ -625,7 +759,8 @@ static void sendSensorDataToClient(psvrd_client_state_t *clientState)
     sendMessageToClient(clientState, &message.header);
 }
 
-static void broadcastNewSensorState(void)
+static void
+broadcastNewSensorState(void)
 {
     for(int i = 0; i < MAX_NUMBER_OF_CLIENTS; ++i)
     {
@@ -635,7 +770,8 @@ static void broadcastNewSensorState(void)
     }
 }
 
-static void writePendingClientMessages(psvrd_client_state_t *clientState)
+static void
+writePendingClientMessages(psvrd_client_state_t *clientState)
 {
     psvrd_generic_message_t *nextMessage;
     ssize_t n;
@@ -664,7 +800,8 @@ static void writePendingClientMessages(psvrd_client_state_t *clientState)
         disableClientWritePolling(clientState);
 }
 
-static int readAndProcessClientMessage(psvrd_client_state_t *clientState)
+static int
+readAndProcessClientMessage(psvrd_client_state_t *clientState)
 {
     psvrd_generic_message_t genericMessage;
     ssize_t n;
@@ -720,6 +857,14 @@ static int readAndProcessClientMessage(psvrd_client_state_t *clientState)
         clientState->sensorStreamEnabled = 1;
         sendSensorDataToClient(clientState);
         break;
+    case PSVRD_MESSAGE_RECENTER:
+        centerOrientation = psvrd_quaternion_inverse(currentOrientation);
+        sendMessageResponseCode(clientState, genericMessage.header.sequence, PSVRD_RESPONSE_OK);
+        break;
+    case PSVRD_MESSAGE_CALIBRATE_SENSORS:
+        resetSensorState();
+        sendMessageResponseCode(clientState, genericMessage.header.sequence, PSVRD_RESPONSE_OK);
+        break;
     default:
         fprintf(stderr, "Received unknown message %08X from client fd number %u.\n", genericMessage.header.type, clientState->fd);
         break;
@@ -728,13 +873,15 @@ static int readAndProcessClientMessage(psvrd_client_state_t *clientState)
     return 1;
 }
 
-static void readAndProcessClientMessages(psvrd_client_state_t *clientState)
+static void
+readAndProcessClientMessages(psvrd_client_state_t *clientState)
 {
     while(readAndProcessClientMessage(clientState))
         ;
 }
 
-static void handleClientSocketEvents(uint32_t clientID, uint32_t events)
+static void
+handleClientSocketEvents(uint32_t clientID, uint32_t events)
 {
     if(clientID >= MAX_NUMBER_OF_CLIENTS)
         return;
@@ -773,7 +920,8 @@ static void handleClientSocketEvents(uint32_t clientID, uint32_t events)
     }
 }
 
-static void handleSocketEvents(uint32_t socketID, uint32_t events)
+static void
+handleSocketEvents(uint32_t socketID, uint32_t events)
 {
     /* 0 means this is a libusb fd. */
     if(socketID == 0)
@@ -791,7 +939,8 @@ static void handleSocketEvents(uint32_t socketID, uint32_t events)
     }
 }
 
-static void pollfdAdded(int fd, short events, void *userData)
+static void
+pollfdAdded(int fd, short events, void *userData)
 {
     struct epoll_event event;
     event.data.u32 = 0;
@@ -799,12 +948,14 @@ static void pollfdAdded(int fd, short events, void *userData)
     epoll_ctl(epollHandle, EPOLL_CTL_ADD, fd, &event);
 }
 
-static void pollfdRemoved(int fd, void *userData)
+static void
+pollfdRemoved(int fd, void *userData)
 {
     epoll_ctl(epollHandle, EPOLL_CTL_DEL, fd, NULL);
 }
 
-static void mainLoop(void)
+static void
+mainLoop(void)
 {
     struct epoll_event pendingEvents[64];
 
@@ -874,8 +1025,11 @@ static void mainLoop(void)
     close(epollHandle);
 }
 
-static int serverMain(void)
+static int
+serverMain(void)
 {
+    resetSensorState();
+
     int error = initializeLibUSB();
     if(error)
         return error;
@@ -893,7 +1047,8 @@ static int serverMain(void)
     return 0;
 }
 
-static void printHelp(void)
+static void
+printHelp(void)
 {
     printf(
 "psvrd [options]                                                             \n\
@@ -904,16 +1059,19 @@ static void printHelp(void)
     );
 }
 
-static void printVersion(void)
+static void
+printVersion(void)
 {
 }
 
-static int startDaemon(void)
+static int
+startDaemon(void)
 {
     return 0;
 }
 
-int main(int argc, char* argv[])
+int
+main(int argc, char* argv[])
 {
     int daemon = 0;
     for(int i = 1; i < argc; ++i)

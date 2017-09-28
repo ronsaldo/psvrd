@@ -1,4 +1,4 @@
-#include <psvrd.h>
+#include <psvrd-client.h>
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -7,13 +7,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <libusb.h>
 
 #include <sys/epoll.h>
 #include <errno.h>
 
-static int socketHandle;
-static uint32_t nextSequenceNumber = 0;
+static psvrd_client_connection_t *connection;
 
 typedef int (*commandHandler_t) (int argc, const char **argv);
 typedef struct command_definition_s
@@ -23,62 +21,9 @@ typedef struct command_definition_s
     commandHandler_t commandHandler;
 } command_definition_t;
 
-static psvrd_response_code_t waitForResponseCode(uint32_t requestSequence)
-{
-    // Wait for the response
-    for(;;)
-    {
-        psvrd_generic_message_t message;
-        ssize_t n = recv(socketHandle, &message, sizeof(message), 0);
-        if(n < 0)
-        {
-            perror("Failed to receive response message");
-            return PSVRD_RESPONSE_ERROR;
-        }
 
-        if(message.header.flags & PSVRD_MESSAGE_FLAG_RESPONSE &&
-            message.header.requestSequence == requestSequence)
-        {
-            if(message.header.type == PSVRD_MESSAGE_RESPONSE_CODE && message.header.length >= sizeof(psvrd_message_response_t))
-            {
-                psvrd_message_response_t *response = (psvrd_message_response_t*)&message;
-                return response->code;
-            }
-
-            break;
-        }
-    }
-
-    return PSVRD_RESPONSE_ERROR;
-}
-
-static int sendSimpleCommand(psvrd_message_type_t type)
-{
-    uint32_t requestSequence = nextSequenceNumber++;
-
-    {
-        psvrd_message_header_t header;
-        header.type = type;
-        header.length = sizeof(header);
-        header.sequence = requestSequence;
-        ssize_t n = send(socketHandle, &header, sizeof(header), 0);
-        if(n < 0)
-        {
-            perror("Failed to send message");
-            return 1;
-        }
-    }
-
-    psvrd_response_code_t response = waitForResponseCode(requestSequence);
-    if(response != PSVRD_RESPONSE_OK)
-    {
-        fprintf(stderr, "Got error response code: %d\n", response);
-    }
-
-    return response != PSVRD_RESPONSE_OK;
-}
-
-static int headsetCommand(int argc, const char *argv[])
+static int
+headsetCommand(int argc, const char *argv[])
 {
     int on = 1;
     if(argc >= 1)
@@ -89,27 +34,43 @@ static int headsetCommand(int argc, const char *argv[])
             on = 0;
     }
 
-    return sendSimpleCommand(on ? PSVRD_MESSAGE_HEADSET_ON : PSVRD_MESSAGE_HEADSET_OFF);
+    return psvrd_client_headsetPower(connection, on);
 }
 
-static int vrCommand(int argc, const char *argv[])
+static int
+vrCommand(int argc, const char *argv[])
 {
-    return sendSimpleCommand(PSVRD_MESSAGE_ACTIVATE_VR_MODE);
+    return psvrd_client_enterVRMode(connection);
 }
 
-static int cinematicCommand(int argc, const char *argv[])
+static int
+cinematicCommand(int argc, const char *argv[])
 {
-    return sendSimpleCommand(PSVRD_MESSAGE_CINEMATIC_MODE);
+    return psvrd_client_enterCinematicMode(connection);
 }
 
-static int poweroffCommand(int argc, const char *argv[])
+static int
+poweroffCommand(int argc, const char *argv[])
 {
-    return sendSimpleCommand(PSVRD_MESSAGE_POWER_OFF);
+    return psvrd_client_powerOff(connection);
 }
 
-static int readsensorCommand(int argc, const char *argv[])
+static int
+recenterCommand(int argc, const char *argv[])
 {
-    int error = sendSimpleCommand(PSVRD_MESSAGE_REQUEST_SENSOR_STREAM);
+    return psvrd_client_recenter(connection);
+}
+
+static int
+calibrateCommand(int argc, const char *argv[])
+{
+    return psvrd_client_calibrateSensors(connection);
+}
+
+static int
+readsensorCommand(int argc, const char *argv[])
+{
+    int error = psvrd_client_requestSensorStream(connection);
     if(error)
         return error;
 
@@ -117,23 +78,17 @@ static int readsensorCommand(int argc, const char *argv[])
 
     for(;;)
     {
-        ssize_t n = recv(socketHandle, &message, sizeof(message), 0);
-        if(n < 0)
-        {
-            if(errno == EINTR)
-                continue;
+        psvrd_client_error_t clientError = psvrd_client_waitMessageOfType(connection, PSVRD_MESSAGE_SENSOR_STATE, &message);
+        if(clientError)
             break;
-        }
-
-        /* Ignore non-sensor messages */
-        if(n != message.header.length || message.header.type != PSVRD_MESSAGE_SENSOR_STATE)
-            continue;
 
         psvrd_sensor_state_t *state = (psvrd_sensor_state_t *)&message;
-        printf("g: %6.1f %6.1f %6.1f a: %6.3f %6.3f %6.3f q: %0.3f %0.5f %0.5f %0.5f\r",
+        printf("g: %6.3f %6.3f %6.3f a: %6.3f %6.3f %6.3f w: %8.5f %8.5f %8.5f %8.5f q: %8.5f %8.5f %8.5f %8.5f\r",
             state->rawSensorStates[0].gyroscope.x, state->rawSensorStates[0].gyroscope.y, state->rawSensorStates[0].gyroscope.z,
             state->rawSensorStates[0].accelerometer.x, state->rawSensorStates[0].accelerometer.y, state->rawSensorStates[0].accelerometer.z,
-            state->orientation.w, state->orientation.x, state->orientation.y, state->orientation.z);
+            state->omega.w, state->omega.x, state->omega.y, state->omega.z,
+            state->orientation.w, state->orientation.x, state->orientation.y, state->orientation.z
+            );
         fflush(stdout);
     }
 
@@ -145,6 +100,9 @@ static const command_definition_t commands[] = {
     {"cinematic", "cinematic\n\nEnter into cinematic mode.", cinematicCommand},
     {"vr", "vr\n\nEnter into VR mode.", vrCommand},
 
+    {"recenter", "recenter\n\nChange the current center.", recenterCommand},
+    {"calibrate", "calibrate [sensors]\n\nCalibrate the sensors.", calibrateCommand},
+
     {"poweroff", "poweroff\n\nTurns off the PS VR processing unit box.", poweroffCommand},
 
     {"readsensor", "readsensor\n\nStarts reading the sensor data.", readsensorCommand},
@@ -152,7 +110,8 @@ static const command_definition_t commands[] = {
     {NULL, NULL, NULL},
 };
 
-static void printHelp()
+static void
+printHelp()
 {
     printf("psvrd_control [options] command [commmand options]...\n");
 
@@ -164,11 +123,13 @@ static void printHelp()
 
 }
 
-static void printVersion()
+static void
+printVersion()
 {
 }
 
-int main(int argc, const char *argv[])
+int
+main(int argc, const char *argv[])
 {
     int i;
 
@@ -220,30 +181,17 @@ int main(int argc, const char *argv[])
     }
 
     /* Create the socket. */
-    socketHandle = socket(AF_UNIX, SOCK_SEQPACKET, 0);
-    if(socketHandle < 0)
+    connection = psvrd_client_openConnection();
+    if(!connection)
     {
-       perror("Failed to create an Unix domain socket.\n");
-       return 1;
-    }
-
-    /* Connect to the server. */
-    struct sockaddr_un address;
-    memset(&address, 0, sizeof(address));
-    address.sun_family = AF_UNIX;
-    strcpy(address.sun_path, PSVR_SOCKET_LOCATION);
-    int error = connect(socketHandle, (const struct sockaddr *)&address, sizeof(address));
-    if(error)
-    {
-        perror("Failed to connect to the psvrd daemon");
+        fprintf(stderr, "Failed to connect to the psvrd daemon.\n");
         return 1;
     }
 
     /* Process the command. */
     command->commandHandler(commandArgc, commandArgv);
 
-    /* Close the socket. */
-    shutdown(socketHandle, SHUT_RDWR);
-    close(socketHandle);
+    /* Close the connection. */
+    psvrd_client_closeConnection(connection);
     return 0;
 }

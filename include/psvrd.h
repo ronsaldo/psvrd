@@ -6,7 +6,10 @@
 #define PSVR_SOCKET_LOCATION "/var/run/psvr.socket"
 
 #define PSVRD_FOURCC(a, b, c, d) ((a) | ((b) << 8) | ((c) << 16) | ((d) << 24))
-#define PSVRD_MAX_MESSAGE_SIZE 256
+#define PSVRD_MAX_MESSAGE_SIZE 512
+
+typedef double psvrd_scalar_t;
+typedef uint32_t psvrd_sequence_t;
 
 typedef enum psvrd_message_type_e {
     /* Activation commands. */
@@ -15,6 +18,10 @@ typedef enum psvrd_message_type_e {
     PSVRD_MESSAGE_POWER_OFF = PSVRD_FOURCC('P', 'W', 'R', 'O'),
     PSVRD_MESSAGE_ACTIVATE_VR_MODE = PSVRD_FOURCC('V', 'R', 'M', 'D'),
     PSVRD_MESSAGE_CINEMATIC_MODE = PSVRD_FOURCC('C', 'N', 'M', 'D'),
+
+    /* Calibration sensor and centering. */
+    PSVRD_MESSAGE_CALIBRATE_SENSORS = PSVRD_FOURCC('C', 'A', 'L', 'S'),
+    PSVRD_MESSAGE_RECENTER = PSVRD_FOURCC('R', 'C', 'N', 'T'),
 
     /* Request the server to send us a continous stream with the sensor data. */
     PSVRD_MESSAGE_REQUEST_SENSOR_STREAM = PSVRD_FOURCC('S', 'N', 'S', 'T'),
@@ -40,10 +47,12 @@ typedef enum psvrd_response_code_e {
 typedef struct psvrd_message_header_s
 {
     psvrd_message_type_t type;
-    uint16_t length; /* Includes the size of the header. */
-    uint32_t sequence;
-    uint32_t requestSequence;
+    uint32_t length; /* Includes the size of the header. */
+    psvrd_sequence_t sequence;
+    psvrd_sequence_t requestSequence;
+
     uint32_t flags;
+    uint32_t padding;
 } psvrd_message_header_t;
 
 /**
@@ -51,7 +60,7 @@ typedef struct psvrd_message_header_s
  */
 typedef struct psvrd_quaternion_s
 {
-    float x, y, z, w;
+    psvrd_scalar_t x, y, z, w;
 } psvrd_quaternion_t;
 
 /**
@@ -59,7 +68,7 @@ typedef struct psvrd_quaternion_s
  */
 typedef struct psvrd_vector3_s
 {
-    float x, y, z;
+    psvrd_scalar_t x, y, z;
 } psvrd_vector3_t;
 
 /**
@@ -67,9 +76,10 @@ typedef struct psvrd_vector3_s
  */
 typedef struct psvrd_raw_sensor_state_s
 {
-    uint32_t milliseconds;
     psvrd_vector3_t gyroscope;
     psvrd_vector3_t accelerometer;
+    uint32_t milliseconds;
+    uint32_t padding;
 } psvrd_raw_sensor_state_t;
 
 /**
@@ -82,9 +92,11 @@ typedef struct psvrd_sensor_state_s
 
     /* Integrated sensor data. */
     psvrd_quaternion_t orientation;
+    psvrd_quaternion_t omega;
     psvrd_vector3_t translation;
 
     /* Raw sensor data. */
+    uint32_t padding;
     uint32_t rawSensorStateCount;
     psvrd_raw_sensor_state_t rawSensorStates[4];
 } psvrd_sensor_state_t;
