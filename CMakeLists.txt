@@ -17,7 +17,6 @@ if(${CMAKE_SYSTEM_NAME} STREQUAL Emscripten)
 endif()
 
 # Output paths.
-set(CMAKE_DEBUG_POSTFIX "_d")
 
 set(CMAKE_INSTALL_PREFIX "${CMAKE_CURRENT_BINARY_DIR}/dist")
 set(PSVRD_DATA_PREFIX "${CMAKE_CURRENT_BINARY_DIR}/dist/data")
