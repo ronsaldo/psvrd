@@ -25,6 +25,6 @@ Any firmware update to the PS VR processing unit could render this software usel
 - readsensor - Starts reading the sensor data.
 
 ## Acknowledgements
-We thank Agustín Gimenez Bernad for making PSVRFramework ( https://github.com/gusmanb/PSVRFramework )
+We thank Agustín Gimenez Bernad for making PSVRFramework ( https://github.com/gusmanb/PSVRFramework ),
 and giving us permission on using PSVRFramework as documentation for the low-level
 USB protocol used by the PS VR processing unit box.
