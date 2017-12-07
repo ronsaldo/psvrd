@@ -1,5 +1,7 @@
 #include <psvrd.h>
 #include "message_queue.h"
+#include "MadgwickAHRS.h"
+#include "MahonyAHRS.h"
 #include "vmath.h"
 
 #include <sys/socket.h>
@@ -151,6 +153,7 @@ static unsigned char sensorReadBuffer[64];
 static psvrd_sensor_state_t currentSensorState;
 static psvrd_quaternion_t centerOrientation;
 static psvrd_quaternion_t currentOrientation;
+static psvrd_quaternion_t currentIntegrationOrientation;
 
 static uint32_t lastIntegrationTimestamp;
 static uint32_t integrationSamples;
@@ -307,10 +310,23 @@ sendControlMessage(const psvr_control_message_t *message)
 
     return PSVRD_RESPONSE_OK;
 }
+
 static psvrd_vector3_t
 rotateSensorCoordinates(psvrd_vector3_t v)
 {
     return psvrd_vector3_new(-v.y, v.x, v.z);
+}
+
+static psvrd_vector3_t
+rotateForMadgwick(psvrd_vector3_t v)
+{
+    return psvrd_vector3_new(v.x, -v.z, v.y);
+}
+
+static psvrd_quaternion_t
+rotateInverseForMadgwick(psvrd_quaternion_t q)
+{
+    return psvrd_quaternion_new(q.x, q.z, -q.y, q.w);
 }
 
 static psvrd_vector3_t
@@ -389,7 +405,7 @@ processCalibrationSensorSample(psvr_sensor_state_t *state)
     printf("Gravity vector: %f %f %f\n",
         gravityVector.x, gravityVector.y, gravityVector.z);
 
-    currentOrientation = psvrd_quaternion_unit();
+    currentOrientation = currentIntegrationOrientation = psvrd_quaternion_unit();
     centerOrientation = psvrd_quaternion_inverse(currentOrientation);
 
     printf("Gyro bias: %f %f %f, Accel bias: %f %f %f \n",
@@ -411,33 +427,15 @@ integrateSensorState(psvr_sensor_state_t *state)
     /* Compute the delta and handle case of the overflow the overflow */
     int deltaMicroseconds = computeSensorDeltaTime(state->timestamp, lastIntegrationTimestamp);
     lastIntegrationTimestamp = state->timestamp;
-
-    /* Compute the derivative. */
     psvrd_scalar_t delta = deltaMicroseconds* ((psvrd_scalar_t)1e-6);
-    psvrd_quaternion_t omega = psvrd_quaternion_sub(
-            psvrd_quaternion_newv(0, convertGyroscopeVector3(state)),
-            gyroscopeBias);
 
-    /* Integrate the orientation. */
-    psvrd_quaternion_t orientationDerivative = psvrd_quaternion_mul(currentOrientation, psvrd_quaternion_muls(omega, 0.5));
-    psvrd_quaternion_t integratedOrientation = psvrd_quaternion_normalizeNonZero(psvrd_quaternion_add(currentOrientation, psvrd_quaternion_muls(orientationDerivative, delta)));
+    psvrd_vector3_t gyro = rotateForMadgwick(convertGyroscopeVector3(state));
+    psvrd_vector3_t accel = rotateForMadgwick(convertAccelerometerVector3(state));
 
-    /* Compute the tilt. */
-    psvrd_vector3_t accelerometer = psvrd_vector3_sub(convertAccelerometerVector3(state), accelerometerBias);
-    psvrd_quaternion_t tilt = psvrd_quaternion_toRotateVectorIntoAnotherVector(
-        psvrd_vector3_normalizeNonZero(accelerometer),
-        PSVRD_UP_VECTOR);
+    //MadgwickAHRSupdateIMU(gyro.x, gyro.y, gyro.z, accel.x, accel.y, accel.z, delta, MADGWICK_AHRS_DEFAULT_BETA, &currentIntegrationOrientation);
+    MahonyAHRSupdateIMU(gyro.x, gyro.y, gyro.z, accel.x, accel.y, accel.z, delta, MAHONY_TWOKP_DEFAULT, MAHONY_TWOKI_DEFAULT, &currentIntegrationOrientation);
 
-    /* Mix the measures of the two sensors with a complementary filter. */
-    /* TODO: Use a Kalman filter. */
-    currentOrientation = psvrd_quaternion_normalizeNonZero(psvrd_quaternion_add(
-            psvrd_quaternion_muls(integratedOrientation, 1.0 - PSVRD_COMPLEMENTARY_FILTER_ALPHA),
-            psvrd_quaternion_muls(tilt, PSVRD_COMPLEMENTARY_FILTER_ALPHA)
-        ));
-
-    /*currentOrientation = integratedOrientation;*/
-
-    currentSensorState.omega = orientationDerivative;
+    currentOrientation = rotateInverseForMadgwick(currentIntegrationOrientation);
     currentSensorState.orientation = psvrd_quaternion_mul(centerOrientation, currentOrientation);
 }
 

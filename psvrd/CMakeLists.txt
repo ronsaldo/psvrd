@@ -1,5 +1,10 @@
 set(PSVRD_SOURCES
     message_queue.c
+    message_queue.h
+    MadgwickAHRS.c
+    MadgwickAHRS.h
+    MahonyAHRS.c
+    MahonyAHRS.h
     psvrd.c
 )
 
