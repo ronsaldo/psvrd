@@ -5,6 +5,9 @@
 
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
 #include <poll.h>
@@ -12,8 +15,10 @@
 struct psvrd_client_connection_s
 {
     int fd;
+    int sensorStateSharedBufferFD;
+    psvrd_sensor_state_shared_buffer_t *sensorStateSharedBuffer;
+
     psvrd_sequence_t nextSendSequence;
-    psvrd_client_sensor_state_t sensorState;
 };
 
 psvrd_client_connection_t *
@@ -28,16 +33,34 @@ psvrd_client_openConnection(void)
     struct sockaddr_un address;
     memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
-    strcpy(address.sun_path, PSVR_SOCKET_LOCATION);
+    strcpy(address.sun_path, PSVRD_SOCKET_LOCATION);
     int error = connect(socketHandle, (const struct sockaddr *)&address, sizeof(address));
     if(error)
         return NULL;
+
+    /* Open the shmem file */
+    int sensorStateFD = shm_open(PSVRD_SENSOR_STATE_SHMNAME, O_RDONLY, 0);
+    if(sensorStateFD < 0)
+    {
+        close(socketHandle);
+        return NULL;
+    }
+
+    /* Map the shmem buffer */
+    psvrd_sensor_state_shared_buffer_t *sensorStateBuffer = mmap(NULL, sizeof(psvrd_sensor_state_shared_buffer_t), PROT_READ, MAP_SHARED, sensorStateFD, 0);
+    if(sensorStateBuffer == MAP_FAILED)
+    {
+        close(sensorStateFD);
+        close(socketHandle);
+        return NULL;
+    }
 
     /* Create the connection object. */
     psvrd_client_connection_t *connection = malloc(sizeof(psvrd_client_connection_t));
     memset(connection, 0, sizeof(psvrd_client_connection_t));
     connection->fd = socketHandle;
-    connection->sensorState.orientation.w = 1;
+    connection->sensorStateSharedBufferFD = sensorStateFD;
+    connection->sensorStateSharedBuffer = sensorStateBuffer;
     return connection;
 }
 
@@ -47,6 +70,8 @@ psvrd_client_closeConnection(psvrd_client_connection_t *connection)
     if(!connection)
         return;
 
+    munmap(connection->sensorStateSharedBuffer, sizeof(psvrd_client_connection_t));
+    close(connection->sensorStateSharedBufferFD);
     close(connection->fd);
     free(connection);
 }
@@ -240,36 +265,16 @@ psvrd_client_powerOff(psvrd_client_connection_t *connection)
     return psvrd_client_sendSimpleCommand(connection, PSVRD_MESSAGE_POWER_OFF);
 }
 
-psvrd_response_code_t
-psvrd_client_requestSensorStream(psvrd_client_connection_t *connection)
-{
-    return psvrd_client_sendSimpleCommand(connection, PSVRD_MESSAGE_REQUEST_SENSOR_STREAM);
-}
-
 /* Sensor polling. */
 psvrd_client_error_t
 psvrd_client_getCurrentSensorState(psvrd_client_connection_t *connection, psvrd_client_sensor_state_t *sensorState)
 {
-    psvrd_generic_message_t buffer;
-    psvrd_client_error_t error = PSVRD_CLIENT_OK;
-
     if(!connection)
         return PSVRD_CLIENT_ERROR_INVALID_CONNECTION;
 
-    /* Read the pending messages with the sensor data. */
-    while((error = psvrd_client_pollMessage(connection, &buffer)) == PSVRD_CLIENT_OK)
-    {
-        if(buffer.header.type == PSVRD_MESSAGE_SENSOR_STATE && buffer.header.length >= sizeof(psvrd_sensor_state_t))
-        {
-            psvrd_sensor_state_t *state = (psvrd_sensor_state_t *)&buffer;
-            connection->sensorState.orientation = state->orientation;
-            connection->sensorState.translation = state->translation;
-        }
-    }
-
-    if(error != PSVRD_CLIENT_ERROR_NO_MESSAGE)
-        return error;
-
-    *sensorState = connection->sensorState;
+    volatile uint32_t sensorStateIndex = connection->sensorStateSharedBuffer->lastIntegratedSensorStateIndex.value & PSVRD_INTEGRATED_SENSOR_STATE_INDEX_MASK;
+    psvrd_integrated_sensor_state_t state = connection->sensorStateSharedBuffer->integratedSensorStates[sensorStateIndex];
+    sensorState->orientation = state.orientation;
+    sensorState->translation = state.translation;
     return PSVRD_CLIENT_OK;
 }

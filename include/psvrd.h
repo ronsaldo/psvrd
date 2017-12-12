@@ -3,13 +3,24 @@
 
 #include <stdint.h>
 
-#define PSVR_SOCKET_LOCATION "/var/run/psvr.socket"
+#define PSVRD_SOCKET_LOCATION "/var/run/psvrd.socket"
+#define PSVRD_SENSOR_STATE_SHMNAME "/psvrd_sensor_state"
 
 #define PSVRD_FOURCC(a, b, c, d) ((a) | ((b) << 8) | ((c) << 16) | ((d) << 24))
 #define PSVRD_MAX_MESSAGE_SIZE 512
 
+#define PSVRD_INTEGRATED_SENSOR_STATE_BUFFER_COUNT (1<<4)
+#define PSVRD_INTEGRATED_SENSOR_STATE_INDEX_MASK (PSVRD_INTEGRATED_SENSOR_STATE_BUFFER_COUNT - 1)
+
 typedef double psvrd_scalar_t;
 typedef uint32_t psvrd_sequence_t;
+
+/* Atomic uint32 value. For sensor state buffer. */
+typedef union __attribute__((aligned(64))) psvrd_atomic_uint_u
+{
+    volatile uint32_t value;
+    uint8_t padding[64];
+} psvrd_atomic_uint32_t;
 
 typedef enum psvrd_message_type_e {
     /* Activation commands. */
@@ -23,14 +34,9 @@ typedef enum psvrd_message_type_e {
     PSVRD_MESSAGE_CALIBRATE_SENSORS = PSVRD_FOURCC('C', 'A', 'L', 'S'),
     PSVRD_MESSAGE_RECENTER = PSVRD_FOURCC('R', 'C', 'N', 'T'),
 
-    /* Request the server to send us a continous stream with the sensor data. */
-    PSVRD_MESSAGE_REQUEST_SENSOR_STREAM = PSVRD_FOURCC('S', 'N', 'S', 'T'),
-
     /* Message responses*/
     PSVRD_MESSAGE_RESPONSE_CODE = PSVRD_FOURCC('R', 'E', 'S', 'C'),
 
-    /* Periodical updates. */
-    PSVRD_MESSAGE_SENSOR_STATE =  PSVRD_FOURCC('S', 'N', 'S', 'R')
 } psvrd_message_type_t;
 
 typedef enum psvrd_response_code_e {
@@ -83,23 +89,23 @@ typedef struct psvrd_raw_sensor_state_s
 } psvrd_raw_sensor_state_t;
 
 /**
- * Sensor state
+ * Integrated sensor state
  */
-typedef struct psvrd_sensor_state_s
+typedef struct psvrd_integrated_sensor_state_s
 {
-    /* The message header. */
-    psvrd_message_header_t header;
-
-    /* Integrated sensor data. */
     psvrd_quaternion_t orientation;
     psvrd_quaternion_t omega;
     psvrd_vector3_t translation;
+} psvrd_integrated_sensor_state_t;
 
-    /* Raw sensor data. */
-    uint32_t padding;
-    uint32_t rawSensorStateCount;
-    psvrd_raw_sensor_state_t rawSensorStates[4];
-} psvrd_sensor_state_t;
+/**
+ * Integrated sensor state buffer.
+ */
+typedef struct psvrd_sensor_state_shared_buffer_s
+{
+    psvrd_atomic_uint32_t lastIntegratedSensorStateIndex;
+    volatile psvrd_integrated_sensor_state_t integratedSensorStates[PSVRD_INTEGRATED_SENSOR_STATE_BUFFER_COUNT];
+} psvrd_sensor_state_shared_buffer_t;
 
 typedef struct psvrd_message_response_s
 {

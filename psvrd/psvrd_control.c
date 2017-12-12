@@ -70,13 +70,7 @@ calibrateCommand(int argc, const char *argv[])
 static int
 readsensorCommand(int argc, const char *argv[])
 {
-    int error = psvrd_client_requestSensorStream(connection);
-    if(error)
-        return error;
-
-    psvrd_generic_message_t message;
-
-    for(;;)
+/*    for(;;)
     {
         psvrd_client_error_t clientError = psvrd_client_waitMessageOfType(connection, PSVRD_MESSAGE_SENSOR_STATE, &message);
         if(clientError)
@@ -91,7 +85,7 @@ readsensorCommand(int argc, const char *argv[])
             );
         fflush(stdout);
     }
-
+*/
     return 0;
 }
 

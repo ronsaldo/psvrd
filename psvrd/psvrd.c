@@ -13,6 +13,8 @@
 #include <string.h>
 #include <libusb.h>
 
+#include <sys/mman.h>
+
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/stat.h>
@@ -150,10 +152,12 @@ static unsigned char controlReadBuffer[1024];
 
 static struct libusb_transfer *sensorReadTransfer;
 static unsigned char sensorReadBuffer[64];
-static psvrd_sensor_state_t currentSensorState;
 static psvrd_quaternion_t centerOrientation;
 static psvrd_quaternion_t currentOrientation;
 static psvrd_quaternion_t currentIntegrationOrientation;
+static psvrd_integrated_sensor_state_t currentIntegratedSensorState;
+static psvrd_sensor_state_shared_buffer_t *sensorStateSharedBuffer;
+static int sensorStateSharedBufferFD;
 
 static uint32_t lastIntegrationTimestamp;
 static uint32_t integrationSamples;
@@ -166,7 +170,7 @@ static int epollHandle;
 
 static psvrd_client_state_t clientStates[MAX_NUMBER_OF_CLIENTS];
 
-static void broadcastNewSensorState(void);
+static void submitNewIntegratedSensorState(void);
 
 static const psvr_control_message_t PSVREnableVRTrackingMessage = {
     .generic = {
@@ -436,21 +440,22 @@ integrateSensorState(psvr_sensor_state_t *state)
     MahonyAHRSupdateIMU(gyro.x, gyro.y, gyro.z, accel.x, accel.y, accel.z, delta, MAHONY_TWOKP_DEFAULT, MAHONY_TWOKI_DEFAULT, &currentIntegrationOrientation);
 
     currentOrientation = rotateInverseForMadgwick(currentIntegrationOrientation);
-    currentSensorState.orientation = psvrd_quaternion_mul(centerOrientation, currentOrientation);
+    currentIntegratedSensorState.orientation = psvrd_quaternion_mul(centerOrientation, currentOrientation);
+    submitNewIntegratedSensorState();
 }
 
 static void
 processSensorData(psvr_sensor_message_t *sensorMessage)
 {
-    currentSensorState.rawSensorStateCount = 2;
-    storeRawSensorState(&sensorMessage->sensorState1, &currentSensorState.rawSensorStates[0]);
-    storeRawSensorState(&sensorMessage->sensorState2, &currentSensorState.rawSensorStates[1]);
-
+    psvrd_raw_sensor_state_t rawSensorState;
+    storeRawSensorState(&sensorMessage->sensorState1, &rawSensorState);
     integrateSensorState(&sensorMessage->sensorState1);
+
+    storeRawSensorState(&sensorMessage->sensorState2, &rawSensorState);
     integrateSensorState(&sensorMessage->sensorState2);
+
     //printHexDump(transfer->buffer, transfer->actual_length);
     //printSensorMessage();
-    broadcastNewSensorState();
 }
 
 static void
@@ -599,10 +604,10 @@ startSocket(void)
     struct sockaddr_un address;
     memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
-    strcpy(address.sun_path, PSVR_SOCKET_LOCATION);
+    strcpy(address.sun_path, PSVRD_SOCKET_LOCATION);
 
     /* Unlink any previous version of the socket. */
-    unlink(PSVR_SOCKET_LOCATION);
+    unlink(PSVRD_SOCKET_LOCATION);
     int error = bind(socketHandle, (const struct sockaddr *)&address, sizeof(address));
     if(error < 0)
     {
@@ -610,9 +615,53 @@ startSocket(void)
         return 1;
     }
 
-    chmod(PSVR_SOCKET_LOCATION, 0777);
+    chmod(PSVRD_SOCKET_LOCATION, 0666);
     listen(socketHandle, 30);
 
+    return 0;
+}
+
+static void
+submitNewIntegratedSensorState(void)
+{
+    uint32_t nextSensorIndex = sensorStateSharedBuffer->lastIntegratedSensorStateIndex.value + 1;
+    sensorStateSharedBuffer->integratedSensorStates[nextSensorIndex & PSVRD_INTEGRATED_SENSOR_STATE_INDEX_MASK] = currentIntegratedSensorState;
+    sensorStateSharedBuffer->lastIntegratedSensorStateIndex.value = nextSensorIndex;
+}
+
+static int
+openSHMemBuffers(void)
+{
+    int i;
+
+    /* Open the shared memory file. */
+    sensorStateSharedBufferFD = shm_open(PSVRD_SENSOR_STATE_SHMNAME, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    if(sensorStateSharedBufferFD < 0)
+    {
+        perror("Failed to open sensor state shmem file buffer");
+        return 1;
+    }
+
+    /* Set the shared memory buffer size */
+    const size_t bufferSize = (sizeof(psvrd_sensor_state_shared_buffer_t) + 4095) & (-4096);
+    ftruncate(sensorStateSharedBufferFD, bufferSize);
+
+    /* mmap the shared memory buffer. */
+    sensorStateSharedBuffer = (psvrd_sensor_state_shared_buffer_t*)mmap(NULL, bufferSize, PROT_READ | PROT_WRITE, MAP_SHARED, sensorStateSharedBufferFD, 0);
+    if(sensorStateSharedBuffer == MAP_FAILED)
+    {
+        perror("Failed to mmap sensor state buffer");
+        return 1;
+    }
+
+    // Clear the sensor state buffer.
+    memset(sensorStateSharedBuffer, 0, sizeof(psvrd_sensor_state_shared_buffer_t));
+
+    for(i = 0; i < PSVRD_INTEGRATED_SENSOR_STATE_BUFFER_COUNT; ++i)
+    {
+        volatile psvrd_integrated_sensor_state_t *sensorState = &sensorStateSharedBuffer->integratedSensorStates[i];
+        sensorState->orientation = psvrd_quaternion_unit();
+    }
     return 0;
 }
 
@@ -746,29 +795,6 @@ sendMessageResponseCode(psvrd_client_state_t *clientState, uint32_t requestSeque
 }
 
 static void
-sendSensorDataToClient(psvrd_client_state_t *clientState)
-{
-    psvrd_sensor_state_t message = currentSensorState;
-    message.header.type = PSVRD_MESSAGE_SENSOR_STATE;
-    message.header.sequence = clientState->sendSequence++;
-    message.header.requestSequence = 0;
-    message.header.length = sizeof(message);
-    message.header.flags = 0;
-    sendMessageToClient(clientState, &message.header);
-}
-
-static void
-broadcastNewSensorState(void)
-{
-    for(int i = 0; i < MAX_NUMBER_OF_CLIENTS; ++i)
-    {
-        psvrd_client_state_t *client = &clientStates[i];
-        if(client->isValid && client->sensorStreamEnabled)
-            sendSensorDataToClient(client);
-    }
-}
-
-static void
 writePendingClientMessages(psvrd_client_state_t *clientState)
 {
     psvrd_generic_message_t *nextMessage;
@@ -847,13 +873,6 @@ readAndProcessClientMessage(psvrd_client_state_t *clientState)
     case PSVRD_MESSAGE_CINEMATIC_MODE:
         responseCode = sendControlMessage(&PSVRLeaveVRMode);
         sendMessageResponseCode(clientState, genericMessage.header.sequence, responseCode);
-        break;
-    case PSVRD_MESSAGE_REQUEST_SENSOR_STREAM:
-        responseCode = PSVRD_RESPONSE_OK;
-        sendMessageResponseCode(clientState, genericMessage.header.sequence, responseCode);
-
-        clientState->sensorStreamEnabled = 1;
-        sendSensorDataToClient(clientState);
         break;
     case PSVRD_MESSAGE_RECENTER:
         centerOrientation = psvrd_quaternion_inverse(currentOrientation);
@@ -1033,6 +1052,10 @@ serverMain(void)
         return error;
 
     error = startSocket();
+    if(error)
+        return error;
+
+    error = openSHMemBuffers();
     if(error)
         return error;
 
