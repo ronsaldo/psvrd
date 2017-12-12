@@ -314,7 +314,7 @@ sendControlMessage(const psvr_control_message_t *message)
 static psvrd_vector3_t
 rotateSensorCoordinates(psvrd_vector3_t v)
 {
-    return psvrd_vector3_new(-v.y, v.x, v.z);
+    return psvrd_vector3_new(v.y, v.x, -v.z);
 }
 
 static psvrd_vector3_t
